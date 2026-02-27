@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Schadeherstel Pro - Cloud Edition</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+        
+        body { 
+            font-family: 'Plus Jakarta Sans', sans-serif; 
+            -webkit-font-smoothing: antialiased;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+
+        .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); }
+        
+        .fab { 
+            position: fixed; 
+            bottom: 100px; 
+            right: 24px; 
+            width: 64px; 
+            height: 64px; 
+            border-radius: 20px; 
+            background: #2563eb; 
+            color: white; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            box-shadow: 0 10px 25px rgba(37,99,235,0.4); 
+            z-index: 50; 
+        }
+        
+        .status-wachtend { border-left: 6px solid #94a3b8; }
+        .status-herstel { border-left: 6px solid #f59e0b; }
+        .status-spuiten { border-left: 6px solid #3b82f6; }
+        .status-gereed { border-left: 6px solid #22c55e; }
+
+        .print-only { display: none; }
+        @media print {
+            .no-print { display: none !important; }
+            .print-only { display: block !important; }
+            body { background: white; padding: 0; }
+            .print-card { border: 2px solid #000; margin-bottom: 20px; page-break-inside: avoid; }
+        }
+    </style>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+
+        // 1. Initialisatie en Config Check
+        const hasConfig = (typeof __firebase_config !== 'undefined') && __firebase_config;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'schadeherstel-pro-v1';
+        let db, auth;
+
+        // State management
+        let tasks = [];
+        let customers = [];
+        let viewDate = new Date();
+        let selectedDate = new Date();
+        let currentUser = null;
+
+        const months = ["Januari", "Februari", "Maart", "April", "Mei", "Juni", "Juli", "Augustus", "September", "Oktober", "November", "December"];
+        const hourlyRate = 95.00;
+
+        const getIsoDate = (date) => {
+            const d = new Date(date);
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        };
+
+        // 2. Window-level functies voor HTML interactie
+        window.showStatus = (msg, type) => {
+            const statusEl = document.getElementById('cloud-status');
+            if (!statusEl) return;
+            statusEl.innerText = msg;
+            statusEl.className = `fixed top-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-[10px] font-bold uppercase tracking-widest z-[200] transition-all shadow-sm ${type === 'success' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`;
+            statusEl.classList.remove('opacity-0');
+            setTimeout(() => statusEl.classList.add('opacity-0'), 3000);
+        };
+
+        window.changeMonth = (dir) => { 
+            viewDate.setMonth(viewDate.getMonth() + dir); 
+            renderAll(); 
+        };
+
+        window.switchView = (view) => {
+            document.querySelectorAll('.view-section').forEach(s => s.classList.add('hidden'));
+            const viewEl = document.getElementById(`view-${view}`);
+            if (viewEl) viewEl.classList.remove('hidden');
+            
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('text-blue-600', 'active'));
+            const activeNav = document.getElementById(`nav-mobile-${view}`);
+            if (activeNav) activeNav.classList.add('text-blue-600', 'active');
+            
+            ['agenda', 'klanten'].forEach(id => {
+                const btn = document.getElementById(`nav-desktop-${id}`);
+                if (btn) {
+                    btn.className = id === view 
+                        ? 'px-8 py-2.5 rounded-xl font-bold text-sm transition-all bg-slate-900 text-white shadow-md' 
+                        : 'px-8 py-2.5 rounded-xl font-bold text-sm transition-all text-slate-500 hover:bg-slate-50';
+                }
+            });
+
+            if (view === 'klanten') renderKlanten();
+        };
+
+        window.openModal = () => { 
+            document.getElementById('modal').classList.remove('hidden'); 
+            setupAutoCalculations(); 
+        };
+        
+        window.closeModal = () => { 
+            document.getElementById('modal').classList.add('hidden');
+            document.getElementById('client-suggestions').classList.add('hidden');
+            ['task-client','task-phone','task-plate','task-brand','task-insurance','task-desc'].forEach(id => {
+                const el = document.getElementById(id);
+                if(el) el.value = '';
+            });
+            document.getElementById('task-cost-parts').value = '0';
+            document.getElementById('task-hours').value = '0';
+            setSafeText('modal-total-display', '€ 0,00');
+        };
+
+        window.saveTask = async () => {
+            if (!currentUser || !db) return alert("Geen cloud-verbinding beschikbaar.");
+            const client = document.getElementById('task-client').value.trim();
+            const phone = document.getElementById('task-phone').value.trim();
+            const plateRaw = document.getElementById('task-plate').value.toUpperCase().trim();
+            const brand = document.getElementById('task-brand').value.trim();
+            
+            if (!client) return alert("Klantnaam is verplicht.");
+
+            const customerId = (client + phone).toLowerCase().replace(/[^a-z0-9]/g, '');
+            const taskId = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : Date.now().toString();
+
+            const data = {
+                client,
+                phone,
+                customerId,
+                plate: plateRaw || "Geen kenteken",
+                plateClean: plateRaw.replace(/[^A-Z0-9]/g, ''),
+                brand: brand || "Onbekend voertuig",
+                insurance: document.getElementById('task-insurance').value.trim(),
+                status: document.getElementById('task-status').value,
+                description: document.getElementById('task-desc').value.trim(),
+                costParts: parseFloat(document.getElementById('task-cost-parts').value || 0),
+                hours: parseFloat(document.getElementById('task-hours').value || 0),
+                date: getIsoDate(selectedDate),
+                timestamp: Date.now()
+            };
+
+            try {
+                await setDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, 'tasks', taskId), data);
+                
+                await setDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, 'customers', customerId), {
+                    id: customerId,
+                    name: client,
+                    phone: phone,
+                    insurance: data.insurance,
+                    plateClean: data.plateClean
+                }, { merge: true });
+
+                closeModal();
+            } catch (e) { alert("Fout bij opslaan."); }
+        };
+
+        window.deleteTask = async (id) => {
+            if (!currentUser || !db || !confirm("Dossier verwijderen?")) return;
+            await deleteDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, 'tasks', id));
+        };
+
+        window.deleteKlant = async (id) => {
+            if (!currentUser || !db || !confirm("Wilt u deze klant en alle bijbehorende historie wissen?")) return;
+            await deleteDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, 'customers', id));
+        };
+
+        // BACK-UP FUNCTIES
+        window.exportToJSON = () => {
+            if(tasks.length === 0 && customers.length === 0) return alert("Geen gegevens om op te slaan.");
+            const data = {
+                tasks,
+                customers,
+                exportDate: new Date().toISOString(),
+                version: "1.0"
+            };
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = `Backup_Schadeherstel_${getIsoDate(new Date())}.json`;
+            link.click();
+            showStatus("Back-up opgeslagen in uw downloads", "success");
+        };
+
+        window.triggerImport = () => {
+            document.getElementById('import-file').click();
+        };
+
+        window.handleImport = async (event) => {
+            const file = event.target.files[0];
+            if (!file || !currentUser || !db) return;
+
+            if (!confirm("Wilt u deze back-up importeren naar de cloud?")) return;
+
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    showStatus("Bezig met importeren...", "success");
+
+                    if (data.tasks) {
+                        for (const t of data.tasks) {
+                            await setDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, 'tasks', t.id), t);
+                        }
+                    }
+                    if (data.customers) {
+                        for (const c of data.customers) {
+                            await setDoc(doc(db, 'artifacts', appId, 'users', currentUser.uid, 'customers', c.id), c);
+                        }
+                    }
+                    showStatus("Gegevens succesvol hersteld", "success");
+                } catch (err) {
+                    alert("Fout bij inlezen back-up.");
+                }
+            };
+            reader.readAsText(file);
+        };
+
+        window.exportToCSV = () => {
+            if(tasks.length === 0) return alert("Geen data beschikbaar.");
+            let csv = "Datum;Klant;Voertuig;Kenteken;Fase;Kosten\n";
+            tasks.forEach(t => { 
+                const total = (t.costParts || 0) + ((t.hours || 0) * hourlyRate);
+                csv += `"${t.date}";"${t.client}";"${t.brand}";"${t.plate}";"${t.status}";"${total.toFixed(2)}"\n`; 
+            });
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `Export_Excel.csv`; link.click();
+        };
+
+        window.preparePrint = () => {
+            const content = document.getElementById('print-content');
+            const rangeDisplay = document.getElementById('print-week-range');
+            if (!content) return;
+            content.innerHTML = '';
+            let monday = new Date(selectedDate);
+            monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+            if (rangeDisplay) rangeDisplay.innerText = `${monday.toLocaleDateString('nl-NL')} T/M ${new Date(monday.getTime() + 6*86400000).toLocaleDateString('nl-NL')}`;
+            for (let i = 0; i < 7; i++) {
+                let curr = new Date(monday.getTime() + i*86400000);
+                let dayTasks = tasks.filter(t => t.date === getIsoDate(curr));
+                const dayBox = document.createElement('div');
+                dayBox.className = 'print-card';
+                let html = `<div style="background:#000;color:#fff;padding:8px;font-weight:bold;display:flex;justify-content:space-between"><span>${curr.toLocaleDateString('nl-NL', { weekday:'long', day:'numeric', month:'long' })}</span><span>${dayTasks.length} dossiers</span></div>`;
+                if (dayTasks.length > 0) {
+                    html += `<table style="width:100%;font-size:10px;border-collapse:collapse">`;
+                    dayTasks.forEach(t => { html += `<tr style="border-bottom:1px solid #ddd"><td style="padding:6px;font-weight:bold;width:120px">${t.brand}</td><td style="padding:6px">${t.client}</td><td style="padding:6px;text-transform:uppercase;text-align:right">${t.status}</td></tr>`; });
+                    html += `</table>`;
+                } else html += `<div style="padding:8px;color:#999;font-style:italic">Geen werkzaamheden</div>`;
+                dayBox.innerHTML = html; content.appendChild(dayBox);
+            }
+            window.print();
+        };
+
+        window.handleClientInput = (input) => {
+            const val = input.value.toLowerCase();
+            const box = document.getElementById('client-suggestions');
+            if (!box) return;
+            if (val.length < 2) { box.classList.add('hidden'); return; }
+            const matches = customers.filter(c => (c.name || '').toLowerCase().includes(val));
+            box.innerHTML = '';
+            matches.forEach(m => {
+                const d = document.createElement('div');
+                d.className = "p-4 hover:bg-slate-50 cursor-pointer font-bold text-sm border-b border-slate-50";
+                d.innerText = m.name;
+                d.onclick = () => {
+                    document.getElementById('task-client').value = m.name;
+                    document.getElementById('task-phone').value = m.phone || '';
+                    document.getElementById('task-insurance').value = m.insurance || '';
+                    box.classList.add('hidden');
+                    setupAutoCalculations();
+                };
+                box.appendChild(d);
+            });
+            box.classList.toggle('hidden', matches.length === 0);
+        };
+
+        function setupAutoCalculations() {
+            const partInput = document.getElementById('task-cost-parts');
+            const hourInput = document.getElementById('task-hours');
+            if (!partInput || !hourInput) return;
+            const update = () => {
+                const total = parseFloat(partInput.value || 0) + (parseFloat(hourInput.value || 0) * hourlyRate);
+                setSafeText('modal-total-display', `€ ${total.toFixed(2).replace('.', ',')}`);
+            };
+            partInput.oninput = update;
+            hourInput.oninput = update;
+            update();
+        }
+
+        function setSafeText(id, text) {
+            const el = document.getElementById(id);
+            if (el) el.innerText = text;
+        }
+
+        function renderAll() {
+            updateDisplays();
+            renderCalendar();
+            renderTaskList();
+            updateStats();
+        }
+
+        function updateDisplays() {
+            setSafeText('month-display', `${months[viewDate.getMonth()]} ${viewDate.getFullYear()}`);
+            setSafeText('selected-date-display', selectedDate.toLocaleDateString('nl-NL', { day: 'numeric', month: 'long' }));
+        }
+
+        function renderCalendar() {
+            const grid = document.getElementById('calendar-days');
+            if (!grid) return;
+            grid.innerHTML = '';
+            const year = viewDate.getFullYear(), month = viewDate.getMonth();
+            const firstDay = (new Date(year, month, 1).getDay() + 6) % 7;
+            const daysInMonth = new Date(year, month + 1, 0).getDate();
+            const todayIso = getIsoDate(new Date());
+
+            for (let i = 0; i < firstDay; i++) grid.appendChild(Object.assign(document.createElement('div'), { className: 'h-24 bg-slate-50/10 border-b border-r border-slate-50' }));
+
+            for (let d = 1; d <= daysInMonth; d++) {
+                const date = new Date(year, month, d);
+                const iso = getIsoDate(date);
+                const isSelected = iso === getIsoDate(selectedDate);
+                const dayTasks = tasks.filter(t => t.date === iso);
+                
+                const cell = document.createElement('div');
+                cell.className = `h-24 p-2 border-b border-r border-slate-50 cursor-pointer transition-all ${isSelected ? 'bg-blue-50 ring-2 ring-blue-500 ring-inset' : 'bg-white'}`;
+                cell.onclick = () => { selectedDate = date; renderAll(); };
+                
+                cell.innerHTML = `
+                    <span class="text-xs font-black ${iso === todayIso ? 'bg-blue-600 text-white w-6 h-6 flex items-center justify-center rounded-lg shadow-lg' : 'text-slate-400'}">${d}</span>
+                    <div class="mt-1 flex gap-0.5 flex-wrap pr-1">
+                        ${dayTasks.map(t => {
+                            let color = 'bg-slate-300';
+                            if (t.status === 'gereed') color = 'bg-green-500';
+                            else if (t.status === 'spuiten') color = 'bg-blue-500';
+                            else if (t.status === 'herstel') color = 'bg-orange-500';
+                            return `<div class="w-1.5 h-1.5 rounded-full ${color}"></div>`;
+                        }).join('')}
+                    </div>
+                `;
+                grid.appendChild(cell);
+            }
+        }
+
+        function renderTaskList() {
+            const list = document.getElementById('task-list');
+            if (!list) return;
+            const currentIso = getIsoDate(selectedDate);
+            const dayTasks = tasks.filter(t => t.date === currentIso).sort((a,b) => (a.brand || "").localeCompare(b.brand || ""));
+            list.innerHTML = dayTasks.length ? '' : '<div class="py-10 text-center opacity-20 font-black text-xs uppercase tracking-widest">Geen dossiers</div>';
+            
+            dayTasks.forEach(t => {
+                const total = (t.costParts || 0) + ((t.hours || 0) * hourlyRate);
+                const item = document.createElement('div');
+                item.className = `p-5 rounded-3xl bg-white border border-slate-100 shadow-sm mb-3 status-${t.status}`;
+                item.innerHTML = `
+                    <div class="flex justify-between items-start mb-3">
+                        <div class="flex flex-col">
+                            <span class="text-[11px] font-black text-slate-800 uppercase tracking-tight">${t.brand}</span>
+                            <span class="text-[9px] font-bold text-slate-400 uppercase">${t.plate}</span>
+                        </div>
+                        <button onclick="deleteTask('${t.id}')" class="text-slate-300 hover:text-red-500 font-bold px-2 text-xl">&times;</button>
+                    </div>
+                    <h4 class="font-black text-slate-600 text-sm capitalize">${t.client}</h4>
+                    <div class="flex justify-between items-end mt-2">
+                        <span class="text-[9px] font-black bg-blue-50 text-blue-600 px-2 py-0.5 rounded uppercase">${t.status}</span>
+                        <span class="text-sm font-black text-blue-600">€ ${total.toFixed(2).replace('.', ',')}</span>
+                    </div>
+                `;
+                list.appendChild(item);
+            });
+        }
+
+        function renderKlanten() {
+            const tbody = document.getElementById('klanten-table-body');
+            if (!tbody) return;
+            const searchEl = document.getElementById('klant-search');
+            const search = (searchEl ? searchEl.value : '').toLowerCase();
+            const filtered = customers.filter(c => (c.name || '').toLowerCase().includes(search));
+            
+            tbody.innerHTML = '';
+            filtered.sort((a,b) => (a.name || '').localeCompare(b.name || '')).forEach(c => {
+                const historyCount = tasks.filter(t => t.customerId === c.id).length;
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="p-6">
+                        <div class="font-black text-slate-800 capitalize">${c.name}</div>
+                        <div class="text-[10px] text-slate-400 font-bold">${c.phone || '---'}</div>
+                    </td>
+                    <td class="p-6"><span class="text-[10px] font-black text-blue-600 bg-blue-50 px-2.5 py-1 rounded-full uppercase">${historyCount} Dossiers</span></td>
+                    <td class="p-6 text-right"><button onclick="deleteKlant('${c.id}')" class="text-red-400 font-bold px-3 text-2xl hover:text-red-600">&times;</button></td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function updateStats() {
+            const painting = tasks.filter(t => t.status === 'spuiten').length;
+            const thisPrefix = getIsoDate(viewDate).slice(0, 7);
+            const rev = tasks.reduce((acc, t) => {
+                if(t.date && t.date.startsWith(thisPrefix)) return acc + (t.costParts || 0) + ((t.hours || 0) * hourlyRate);
+                return acc;
+            }, 0);
+            
+            setSafeText('stat-revenue', `€ ${rev.toLocaleString('nl-NL')}`);
+            setSafeText('stat-painting', painting);
+            setSafeText('stat-customers', customers.length);
+        }
+
+        async function initAuth() {
+            if (!auth) return;
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth error:", error);
+                showStatus("Systeem offline", "error");
+            }
+        }
+
+        if (auth) {
+            onAuthStateChanged(auth, (u) => {
+                if (u) {
+                    currentUser = u;
+                    setupSync();
+                }
+            });
+        }
+
+        renderAll();
+    </script>
+</head>
+<body class="bg-[#fcfdfe] text-slate-900">
+
+    <div id="cloud-status" class="opacity-0 pointer-events-none fixed top-4 left-1/2 -translate-x-1/2 z-[200]"></div>
+    
+    <input type="file" id="import-file" class="hidden" accept=".json" onchange="handleImport(event)">
+
+    <div class="flex flex-col h-screen overflow-hidden">
+        <header class="bg-slate-900 text-white p-6 shadow-xl z-50 no-print">
+            <div class="max-w-7xl mx-auto flex justify-between items-center">
+                <div class="flex items-center gap-3">
+                    <div class="bg-blue-600 p-2 rounded-xl shadow-lg">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7"/><circle cx="9" cy="9" r="2"/></svg>
+                    </div>
+                    <h1 class="text-xl font-black tracking-tight">Schadeherstel Pro</h1>
+                </div>
+                <div class="text-right hidden md:flex items-center gap-4">
+                    <div>
+                        <p class="text-[10px] font-bold uppercase opacity-50 tracking-widest leading-none mb-1">Maand Omzet</p>
+                        <p id="stat-revenue" class="text-xl font-black text-blue-400">€ 0</p>
+                    </div>
+                    <div class="flex gap-2 ml-4">
+                        <button onclick="exportToJSON()" class="bg-white/10 hover:bg-white/20 p-2 rounded-lg text-xs font-bold transition-all border border-white/5">Back-up PC</button>
+                        <button onclick="triggerImport()" class="bg-white/10 hover:bg-white/20 p-2 rounded-lg text-xs font-bold transition-all border border-white/5">Herstel</button>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <main class="flex-1 overflow-y-auto pb-32 no-print">
+            <div class="max-w-7xl mx-auto p-4 md:p-8">
+                
+                <div class="hidden md:flex items-center gap-2 mb-8 bg-white p-1.5 rounded-2xl shadow-sm border border-slate-200 w-fit">
+                    <button onclick="switchView('agenda')" id="nav-desktop-agenda" class="px-8 py-2.5 rounded-xl font-bold text-sm transition-all bg-slate-900 text-white shadow-md">Planning</button>
+                    <button onclick="switchView('klanten')" id="nav-desktop-klanten" class="px-8 py-2.5 rounded-xl font-bold text-sm transition-all text-slate-500 hover:bg-slate-50">Klantenbestand</button>
+                </div>
+
+                <div class="grid grid-cols-2 md:grid-cols-3 gap-4 mb-8">
+                    <div class="bg-white p-5 rounded-[2rem] border border-slate-100 shadow-sm transition-transform hover:scale-[1.02]">
+                        <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">In Spuiterij</p>
+                        <span id="stat-painting" class="text-3xl font-black text-blue-600">0</span>
+                    </div>
+                    <div class="bg-white p-5 rounded-[2rem] border border-slate-100 shadow-sm transition-transform hover:scale-[1.02]">
+                        <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1 text-nowrap">Klanten Totaal</p>
+                        <span id="stat-customers" class="text-3xl font-black text-slate-800">0</span>
+                    </div>
+                </div>
+
+                <div id="view-agenda" class="view-section active">
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                        <div class="lg:col-span-2 bg-white rounded-[2.5rem] shadow-sm border border-slate-100 overflow-hidden">
+                            <div class="p-8 border-b border-slate-50 flex justify-between items-center">
+                                <h2 id="month-display" class="text-2xl font-black tracking-tight"></h2>
+                                <div class="flex gap-4">
+                                    <button onclick="changeMonth(-1)" class="font-bold text-slate-400 hover:text-slate-800 transition-colors">Vorige</button>
+                                    <button onclick="changeMonth(1)" class="font-bold text-slate-400 hover:text-slate-800 transition-colors">Volgende</button>
+                                </div>
+                            </div>
+                            <div class="calendar-grid bg-slate-50/50 text-[10px] font-black text-slate-400 uppercase tracking-widest py-3 text-center border-b border-slate-50">
+                                <div>Ma</div><div>Di</div><div>Wo</div><div>Do</div><div>Vr</div><div>Za</div><div>Zo</div>
+                            </div>
+                            <div id="calendar-days" class="calendar-grid"></div>
+                        </div>
+                        <div class="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
+                            <h3 id="selected-date-display" class="text-2xl font-black mb-6 tracking-tight text-slate-800"></h3>
+                            <div id="task-list" class="space-y-4"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="view-klanten" class="view-section hidden text-nowrap">
+                    <div class="bg-white rounded-[2.5rem] shadow-sm border border-slate-100 overflow-hidden">
+                        <div class="p-6 border-b border-slate-50 flex gap-4">
+                            <input type="text" id="klant-search" oninput="renderKlanten()" placeholder="Zoek op klantnaam..." class="w-full p-4 rounded-2xl bg-slate-50 border border-slate-200 font-bold outline-none focus:border-blue-500">
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse">
+                                <tbody id="klanten-table-body" class="divide-y divide-slate-50"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <button onclick="openModal()" class="fab no-print shadow-2xl hover:scale-105 active:scale-95 transition-all">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+
+        <nav class="fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-xl border-t border-slate-200 p-4 pb-8 flex justify-around no-print z-50">
+            <button onclick="switchView('agenda')" id="nav-mobile-agenda" class="nav-item active text-blue-600 flex flex-col items-center gap-1">
+                <span class="text-[10px] font-black uppercase tracking-widest">Planning</span>
+            </button>
+            <button onclick="switchView('klanten')" id="nav-mobile-klanten" class="nav-item flex flex-col items-center gap-1">
+                <span class="text-[10px] font-black uppercase tracking-widest">Klanten</span>
+            </button>
+            <button onclick="exportToJSON()" class="flex flex-col items-center gap-1 text-slate-400">
+                <span class="text-[10px] font-black uppercase tracking-widest">Back-up</span>
+            </button>
+            <button onclick="preparePrint()" class="flex flex-col items-center gap-1 text-slate-400">
+                <span class="text-[10px] font-black uppercase tracking-widest">Print</span>
+            </button>
+        </nav>
+    </div>
+
+    <!-- Modal -->
+    <div id="modal" class="hidden fixed inset-0 bg-slate-900/80 backdrop-blur-md z-[1000] flex items-center justify-center p-0 md:p-6 no-print">
+        <div class="bg-white w-full h-full md:h-auto md:max-w-4xl md:rounded-[3rem] overflow-hidden flex flex-col shadow-2xl">
+            <div class="p-8 border-b flex justify-between items-center bg-slate-50/50">
+                <div>
+                    <h3 class="text-2xl font-black tracking-tight">Schadedossier Invoeren</h3>
+                    <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Nieuwe opdracht</p>
+                </div>
+                <button onclick="closeModal()" class="text-5xl font-light opacity-30 px-4 hover:opacity-100 transition-opacity">&times;</button>
+            </div>
+            <div class="flex-1 overflow-y-auto p-8 grid grid-cols-1 md:grid-cols-3 gap-8">
+                <div class="space-y-4">
+                    <div class="relative">
+                        <label class="text-[10px] font-black text-slate-400 uppercase mb-1 block">Naam Klant (Handelaar)</label>
+                        <input id="task-client" type="text" autocomplete="off" oninput="handleClientInput(this)" class="w-full p-4 rounded-2xl bg-slate-50 border border-slate-200 font-bold outline-none focus:border-blue-500">
+                        <div id="client-suggestions" class="hidden absolute top-full left-0 right-0 bg-white border border-slate-200 rounded-2xl shadow-2xl z-[1100] max-h-48 overflow-y-auto"></div>
+                    </div>
+                    <div>
+                        <label class="text-[10px] font-black text-slate-400 uppercase mb-1 block">Telefoon</label>
+                        <input id="task-phone" type="text" class="w-full p-4 rounded-2xl bg-slate-50 border border-slate-200 font-bold outline-none">
+                    </div>
+                </div>
+                <div class="space-y-4">
+                    <div>
+                        <label class="text-[10px] font-black text-slate-400 uppercase mb-1 block">Voertuig (Merk/Model)</label>
+                        <input id="task-brand" type="text" placeholder="Bijv. VW Golf Blauw" class="w-full p-4 rounded-2xl bg-slate-50 border border-slate-200 font-bold outline-none focus:border-blue-500">
+                    </div>
+                    <div>
+                        <label class="text-[10px] font-black text-slate-400 uppercase mb-1 block">Kenteken (Optioneel)</label>
+                        <input id="task-plate" type="text" placeholder="Of leeg laten" class="w-full p-4 rounded-2xl bg-yellow-50 border border-yellow-200 font-black uppercase outline-none">
+                    </div>
+                    <div>
+                        <label class="text-[10px] font-black text-slate-400 uppercase mb-1 block">Status</label>
+                        <select id="task-status" class="w-full p-4 rounded-2xl bg-slate-50 border border-slate-200 font-black outline-none focus:border-blue-500">
+                            <option value="wachtend">Planning</option>
+                            <option value="herstel">Herstel</option>
+                            <option value="spuiten">Spuiten</option>
+                            <option value="gereed">Gereed</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="space-y-4 text-nowrap">
+                    <div>
+                        <label class="text-[10px] font-black text-slate-400 uppercase mb-1 block">Verzekeraar / Bron</label>
+                        <input id="task-insurance" type="text" class="w-full p-4 rounded-2xl bg-slate-50 border border-slate-200 font-bold outline-none">
+                    </div>
+                    <div class="bg-blue-600 text-white p-6 rounded-[2.5rem] text-center shadow-xl shadow-blue-100">
+                        <p class="text-[10px] font-black uppercase opacity-60 mb-3 tracking-[0.15em]">Calculatie</p>
+                        <div class="grid grid-cols-2 gap-2 mb-4">
+                            <div>
+                                <p class="text-[8px] font-bold uppercase mb-1 opacity-60 text-nowrap">Delen €</p>
+                                <input id="task-cost-parts" type="number" value="0" step="0.01" class="bg-white/10 border-none text-white text-center rounded-xl p-3 w-full font-black outline-none">
+                            </div>
+                            <div>
+                                <p class="text-[8px] font-bold uppercase mb-1 opacity-60 text-nowrap">Uren (u)</p>
+                                <input id="task-hours" type="number" value="0" step="0.5" class="bg-white/10 border-none text-white text-center rounded-xl p-3 w-full font-black outline-none">
+                            </div>
+                        </div>
+                        <p id="modal-total-display" class="text-3xl font-black">€ 0,00</p>
+                    </div>
+                </div>
+            </div>
+            <div class="p-8 border-t bg-slate-50/50">
+                <textarea id="task-desc" placeholder="Extra details of schademelding..." class="w-full p-4 rounded-2xl bg-white border border-slate-200 font-medium text-xs h-24 resize-none outline-none focus:border-blue-500 mb-4"></textarea>
+                <div class="flex flex-col md:flex-row gap-4">
+                    <button onclick="closeModal()" class="w-full md:flex-1 py-4 font-bold text-slate-400 order-2 md:order-1 hover:text-slate-600 transition-colors">Annuleren</button>
+                    <button onclick="saveTask()" class="w-full md:flex-1 py-4 bg-slate-900 text-white rounded-2xl font-black shadow-lg hover:bg-black transition-all order-1 md:order-2">Opslaan</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="print-area" class="print-only p-8">
+        <div class="text-center mb-10 border-b-4 border-slate-900 pb-6">
+            <h1 class="text-3xl font-black uppercase tracking-tight">Schadeherstel Weekoverzicht</h1>
+            <p id="print-week-range" class="text-slate-500 font-bold mt-2 uppercase tracking-widest"></p>
+        </div>
+        <div id="print-content"></div>
+    </div>
+
+</body>
+</html>
